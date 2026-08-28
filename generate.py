@@ -1,24 +1,48 @@
 import pathlib
+import argparse
 import torch
 import torch.nn.functional as F
 from model import NanoGPT
 from tokenmaker import Tokenizer, TokenizerNoIM, TokenizerVocabSize
 from hyperparameters import d_model, n_heads, n_layers, max_seq_len
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--ckpt', type=str, default=None,
+                    help='checkpoint path (default: auto-detect SFT then pretrained)')
+parser.add_argument('--rope-scale', type=float, default=1.0,
+                    help='YaRN context stretch factor (e.g. 2.0 to stretch 64k->128k)')
+parser.add_argument('--max-seq-len', type=int, default=None,
+                    help='inference context length (default: max_seq_len * rope_scale)')
+args = parser.parse_args()
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'device: {device}')
 
 vocab_size = TokenizerVocabSize
 
-model = NanoGPT(vocab_size, d_model, n_heads, n_layers, max_seq_len).to(device)
+# YaRN context extension: the model was TRAINED at max_seq_len (original_max_pos
+# in the model); rope_scale > 1 stretches positions beyond that. The RoPE
+# tables are built for the extended length so the KV cache can grow past
+# the training context.
+original_max_pos = max_seq_len
+if args.max_seq_len is not None:
+    inference_max_seq_len = args.max_seq_len
+else:
+    inference_max_seq_len = max_seq_len * args.rope_scale if args.rope_scale > 1.0 else max_seq_len
+
+model = NanoGPT(vocab_size, d_model, n_heads, n_layers, inference_max_seq_len,
+                rope_scale=args.rope_scale,
+                original_max_pos=original_max_pos).to(device)
 model = model.to(torch.bfloat16)
 
-if pathlib.Path('blacksmith-1_sft.pt').exists():
-    chkp = torch.load('blacksmith-1_sft.pt', map_location=device)
-    print('loaded SFT checkpoint')
+if args.ckpt is not None:
+    chkp_path = args.ckpt
+elif pathlib.Path('blacksmith-1_sft.pt').exists():
+    chkp_path = 'blacksmith-1_sft.pt'
 else:
-    chkp = torch.load('blacksmith-1_model.pt', map_location=device)
-    print('loaded pretrained checkpoint (no SFT found)')
+    chkp_path = 'blacksmith-1_model.pt'
+chkp = torch.load(chkp_path, map_location=device)
+print(f'loaded {chkp_path}')
 model.load_state_dict(chkp['model'])
 model.eval()
 
@@ -84,9 +108,9 @@ def generate(model, token_ids, n_new_tokens, temperature=0.7, top_k=25,
         generated.append(next_token.item())
         token_ids = torch.cat([token_ids, next_token[None, :]], dim=1)
         recent = torch.cat([recent, next_token])
-        if k_caches[0].shape[2] >= max_seq_len:
-            k_caches = [k[:, :, -max_seq_len:, :] for k in k_caches]
-            v_caches = [v[:, :, -max_seq_len:, :] for v in v_caches]
+        if k_caches[0].shape[2] >= inference_max_seq_len:
+            k_caches = [k[:, :, -inference_max_seq_len:, :] for k in k_caches]
+            v_caches = [v[:, :, -inference_max_seq_len:, :] for v in v_caches]
         pos += 1
     return generated
 
@@ -111,17 +135,17 @@ while True:
     context += [IM_END, NEWLINE]
     context += [IM_START] + IM_ROLE_ASSISTANT + [NEWLINE]
 
-    if len(context) > max_seq_len:
+    if len(context) > inference_max_seq_len:
         # Truncate from the front, but only at a turn boundary
         # (after a NEWLINE that follows an IM_END) to avoid splitting a turn.
-        cut = len(context) - max_seq_len
+        cut = len(context) - inference_max_seq_len
         for i in range(cut, len(context)):
             if (i >= 2 and context[i-1] == NEWLINE and context[i-2] == IM_END
                     and context[i] == IM_START):
                 context = context[i:]
                 break
         else:
-            context = context[-max_seq_len:]
+            context = context[-inference_max_seq_len:]
 
     tensor = torch.tensor([context]).to(device)
     response_ids = generate(

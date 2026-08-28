@@ -1,3 +1,5 @@
+import os
+
 import torch
 import numpy as np
 
@@ -45,11 +47,20 @@ class MixedDatasetManager:
             memmaps = []
             lengths = []
             cum = [0]
+            skipped = []
             for f in files:
+                if not os.path.exists(f):
+                    skipped.append(f)
+                    continue
                 m = np.memmap(f, dtype=np.uint16, mode='r')
                 memmaps.append(m)
                 lengths.append(len(m))
                 cum.append(cum[-1] + len(m))
+            if skipped and len(memmaps) == 0:
+                raise FileNotFoundError(
+                    f'source "{name}": none of its files exist '
+                    f'(missing: {skipped})'
+                )
             self.sources.append({
                 'name': name,
                 'memmaps': memmaps,
@@ -57,6 +68,7 @@ class MixedDatasetManager:
                 'cum': np.array(cum, dtype=np.int64),
                 'total': cum[-1],
                 'weight': weight / total_weight,
+                'missing': skipped,
             })
 
         self.weights = torch.tensor([s['weight'] for s in self.sources],

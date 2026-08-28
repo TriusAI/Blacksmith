@@ -14,11 +14,22 @@ from transformers import GPT2Tokenizer
 #     Blue, when it's sunny and the sun is not blocked by the clouds.<|im_end|>
 
 TokenizerNoIM = GPT2Tokenizer.from_pretrained('gpt2')
-Tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+TokenizerNoThinking = GPT2Tokenizer.from_pretrained('gpt2')
 _additional_token = [
     '<|im_start|>',
     '<|im_end|>',
 ]
+TokenizerNoThinking.add_special_tokens({'additional_special_tokens': _additional_token})
+
+Tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+_additional_token = [
+    '<|im_start|>',
+    '<|im_end|>',
+    '<think>',
+    '</think>',
+]
 Tokenizer.add_special_tokens({'additional_special_tokens': _additional_token})
+
 TokenizerVocabSize = Tokenizer.vocab_size + len(_additional_token)
 

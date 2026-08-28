@@ -14,6 +14,7 @@ from hyperparameters import *
 # torchrun --nproc_per_node=N --master_addr=127.0.0.1 --master_port=29500 ./main.py
 
 os.environ['AMD_SERIALIZE_KERNEL']='3'
+os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 
 # ---------------------------------------------------------------------------
 # Distributed setup
@@ -37,11 +38,16 @@ if is_main:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-# TODO: tune the mixing weights to taste. 0.85 / 0.15 is a reasonable default
-# for "mostly pretraining, a little chat formatting".
+# Mixing weights (v2 corpus, ~38.5B tokens total):
+#   slimpajama 14.1B - general web/book/wiki text (core knowledge)
+#   cosmopedia 20.6B - synthetic educational text (reasoning-ish prose)
+#   ultrachat    1.9B - chat format (if the .bin is present on this machine)
+#   openthought  0.8B - reasoning traces w/ <think></think> tags (capability data)
 dataset = MixedDatasetManager(device, [
-    ('cosmopedia', sorted(glob.glob('cosmopediav2_*.bin')), 0.85),
-    ('ultrachat',  ['UltraChat_uint16le.bin'],               0.15),
+    ('slimpajama', sorted(glob.glob('slimpajama_subset_*.bin')), 0.40),
+    ('cosmopedia', sorted(glob.glob('cosmopediav2_*.bin')),      0.35),
+    ('ultrachat',  ['UltraChat_uint16le.bin'],                    0.15),
+    ('openthought', sorted(glob.glob('openthought_*.bin')),       0.10),
 ])
 if is_main:
     print('training data loaded')
@@ -102,8 +108,7 @@ for step in range(last_step, min(last_step + n_steps, total_steps)):
     inputs, targets = dataset.get_batch(batch_size, max_seq_len)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        logits, _, _ = model(inputs)
-    loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+        loss, _, _ = model(inputs, targets=targets)
 
     optimizer.zero_grad()
     loss.backward()
