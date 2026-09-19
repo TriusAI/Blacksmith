@@ -13,6 +13,13 @@ parser.add_argument('--rope-scale', type=float, default=1.0,
                     help='YaRN context stretch factor (e.g. 2.0 to stretch 64k->128k)')
 parser.add_argument('--max-seq-len', type=int, default=None,
                     help='inference context length (default: max_seq_len * rope_scale)')
+parser.add_argument('--eot-between-turns', action=argparse.BooleanOptionalAction, default=True,
+                    help='insert EOT before each user turn, i.e. each input starts a new '
+                         'conversation (matches the EOT-separated UltraChat pretokenization). '
+                         'disable with --no-eot-between-turns for one continuous conversation.')
+parser.add_argument('--think', action='store_true',
+                    help='seed the assistant turn with </think> to elicit reasoning '
+                         '(matches the OpenThoughts pretokenization; off by default).')
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,6 +59,9 @@ IM_START = Tokenizer.encode('<|im_start|>')[0]
 IM_ROLE_USER = Tokenizer.encode('user')
 IM_ROLE_ASSISTANT = Tokenizer.encode('assistant')
 NEWLINE = Tokenizer.encode('\n')[0]
+EOT = Tokenizer.eos_token_id  # 50256; conversation separator in the .bin corpora
+THINK_START = Tokenizer.encode('<think>')[0]
+THINK_END = Tokenizer.encode('</think>')[0]
 
 
 @torch.no_grad()
@@ -84,15 +94,23 @@ def gen_step(model, token_ids, k_caches, v_caches, temperature, pos_offset,
 
 
 def generate(model, token_ids, n_new_tokens, temperature=0.7, top_k=25,
-             repetition_penalty=1.3, repeat_window=64):
+             repetition_penalty=1.3, repeat_window=64, stop_tokens=None,
+             print_fn=None):
     token_ids = token_ids.to(device)
     recent = torch.tensor([], dtype=torch.long, device=device)
+    if stop_tokens is None:
+        stop_tokens = (END_OF_TEXT, IM_END)
+    if print_fn is None:
+        print_fn = lambda tok: None
 
     next_token, k_caches, v_caches = gen_step(
         model, token_ids, None, None, temperature, 0, top_k,
         repetition_penalty, recent,
     )
+    if next_token.item() in stop_tokens:
+        return []
     generated = [next_token.item()]
+    print_fn(next_token.item())
     pos = token_ids.shape[1]
     token_ids = torch.cat([token_ids, next_token[None, :]], dim=1)
     recent = torch.cat([recent, next_token])
@@ -103,9 +121,10 @@ def generate(model, token_ids, n_new_tokens, temperature=0.7, top_k=25,
             model, next_token[None, :], k_caches, v_caches,
             temperature, pos, top_k, repetition_penalty, window,
         )
-        if next_token.item() == END_OF_TEXT or next_token.item() == IM_END:
+        if next_token.item() in stop_tokens:
             break
         generated.append(next_token.item())
+        print_fn(next_token.item())
         token_ids = torch.cat([token_ids, next_token[None, :]], dim=1)
         recent = torch.cat([recent, next_token])
         if k_caches[0].shape[2] >= inference_max_seq_len:
@@ -129,17 +148,27 @@ while True:
         print('(context reset)')
         continue
 
+    if args.eot_between_turns:
+        context += [EOT]
     user_tokens = TokenizerNoIM.encode(user_input)
     context += [IM_START] + IM_ROLE_USER + [NEWLINE]
     context += user_tokens
     context += [IM_END, NEWLINE]
     context += [IM_START] + IM_ROLE_ASSISTANT + [NEWLINE]
+    if args.think:
+        # OpenThoughts format: assistant turn is
+        #   <thinking>{reasoning}</thinking>\n{answer}<|im_end|>
+        context += [THINK_START]
 
     if len(context) > inference_max_seq_len:
-        # Truncate from the front, but only at a turn boundary
-        # (after a NEWLINE that follows an IM_END) to avoid splitting a turn.
+        # Truncate from the front, but only at a boundary so we don't split
+        # a turn: prefer an EOT boundary (EOT followed by <|im_start|>),
+        # falling back to a turn boundary (<|im_end|> NEWLINE <|im_start|>).
         cut = len(context) - inference_max_seq_len
         for i in range(cut, len(context)):
+            if i >= 1 and context[i-1] == EOT and context[i] == IM_START:
+                context = context[i:]
+                break
             if (i >= 2 and context[i-1] == NEWLINE and context[i-2] == IM_END
                     and context[i] == IM_START):
                 context = context[i:]
@@ -148,14 +177,42 @@ while True:
             context = context[-inference_max_seq_len:]
 
     tensor = torch.tensor([context]).to(device)
+    # Phase 1: reasoning (think mode only). The assistant turn was seeded
+    # with </think> (OpenThoughts format); generation stops at </think>,
+    # or at EOT/<|im_end|> if the model never closes it. In either case we
+    # append the </think>\n boundary manually so the turn stays structurally
+    # complete and the answer phase sees the same context the corpus had.
+    answer_seed = [NEWLINE]
+    if args.think:
+        def print_think_token(tok):
+            if tok != THINK_END:
+                print(Tokenizer.decode([tok]), end='', flush=True)
+        think_ids = generate(
+            model, tensor, 1024,
+            temperature=0.7, top_k=25,
+            repetition_penalty=1.3, repeat_window=64,
+            stop_tokens=(THINK_END, END_OF_TEXT, IM_END),
+            print_fn=print_think_token,
+        )
+        print('', flush=True)  # end of the thinking block
+        context += think_ids
+        context += [THINK_END, NEWLINE]
+        answer_seed = []
+
+    # Phase 2: final answer. In think mode the model resumes right after
+    # </think>\n and produces the answer; in non-think mode answer_seed
+    # supplies the NEWLINE that ends the `assistant\n` prefix.
+    tensor = torch.tensor([context + answer_seed]).to(device)
+    if args.think:
+        print('---', flush=True)
     response_ids = generate(
         model, tensor, 500,
         temperature=0.7, top_k=25,
         repetition_penalty=1.3, repeat_window=64,
+        stop_tokens=(END_OF_TEXT, IM_END),
     )
-
     response_text = Tokenizer.decode(response_ids)
     print(response_text, flush=True)
 
-    context += response_ids
+    context += answer_seed + response_ids
     context += [IM_END, NEWLINE]

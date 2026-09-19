@@ -35,6 +35,14 @@ dataset_path = pathlib.Path('/home/bctnry/workspace/datasets/UltraChat/')
 result = open('UltraChat_uint16le.bin', 'wb')
 failed = []
 
+EOT = Tokenizer.eos_token_id
+
+def write_tokens(tokens):
+    for tok in tokens:
+        byte1 = tok%256
+        byte2 = (tok//256)%256
+        result.write(bytes([byte1, byte2]))
+
 for file_i in range(0, 10):   # files: train_0 ~ train_9
     print(f'processing file `train_{file_i}.jsonl`...')
     with open(dataset_path / f'train_{file_i}.jsonl', 'r') as f:
@@ -46,19 +54,18 @@ for file_i in range(0, 10):   # files: train_0 ~ train_9
                 j = json.loads(a)
             except:
                 failed.append((a, file_i, i))
+                continue
             for ii, d in enumerate(j['data']):
                 role = 'user' if ii % 2 == 0 else 'assistant'
-                s = f'<|im_start|>{role}\n{d}<|im_end|>'
+                s = f'<|im_start|>{role}\n{d}<|im_end|>\n'
                 encoded = Tokenizer.encode(s)
-                for tok in encoded:
-                    byte1 = tok%256
-                    byte2 = (tok//256)%256
-                    result.write(bytes([byte1, byte2]))
+                write_tokens(encoded)
+            write_tokens([EOT])
             i += 1
             if i % 100 == 0:
                 print('.', end='', flush=True)
             if i % 10000 == 0:
-                print('')
+                print(f' file {file_i}: {i} conversations', flush=True)
     
 result.close()
 with open('failed_items.txt', 'w') as f:
