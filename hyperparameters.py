@@ -1,6 +1,10 @@
-# Blacksmith-1A: ~522M params for Radeon 8060S iGPU (~15 TFLOP/s effective bf16)
+# Blacksmith-2: ~522M params for Radeon 8060S iGPU (~15 TFLOP/s effective bf16)
 # d=1280, 10 heads (d_head=128), 20 layers
-# VRAM at batch 32: ~21GB (6.3 weights/opt + ~15 activations) - lots of headroom
+# VRAM at batch 32 (full gradient checkpointing, loss chunks of 1024): the
+# allocator holds ~64GB of the 96GB pool at steady state (cached blocks
+# include the loss-chunk fp32 transients). Fits an otherwise-empty pool;
+# sparser checkpointing or bigger loss chunks OOM it (FFN activations are
+# ~5-7GB per non-checkpointed block).
 #
 # Token budget: 10B tokens (~19 tok/param, Chinchilla-ish) = 76k steps
 # at ~36s/step on the iGPU = ~32 days. Resume-safe: checkpoints every 50 steps.
@@ -19,7 +23,7 @@ lr_peak = 3e-4
 warmup_steps = 1500
 weight_decay = 1e-2
 
-# # Blacksmith-1A: 1.62B params (needs a real GPU - ~6 min/step on 8060S)
+# # Blacksmith-2: 1.62B params (needs a real GPU - ~6 min/step on 8060S)
 # d_model = 2048
 # n_heads = 16
 # n_layers = 28

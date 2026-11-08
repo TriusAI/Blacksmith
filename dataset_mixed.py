@@ -88,6 +88,13 @@ class MixedDatasetManager:
         fidx = int(np.searchsorted(source['cum'], s, side='right')) - 1
         local = s - source['cum'][fidx]
         m = source['memmaps'][fidx]
+        # `s` is bounded by the *source* total, so a draw can land within
+        # seq_len of the next file's first token. Slicing there yields a
+        # short window, and the mixed batch then dies in np.stack with
+        # "all input arrays must have the same shape". Re-draw inside this
+        # file so every window stays within a single file.
+        if local + seq_len + 1 > len(m):
+            local = int(torch.randint(0, len(m) - seq_len - 1, (1,)).item())
         x = np.array(m[local:local + seq_len], dtype=np.int64)
         y = np.array(m[local + 1:local + seq_len + 1], dtype=np.int64)
         return x, y

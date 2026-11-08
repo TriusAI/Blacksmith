@@ -159,7 +159,20 @@ class MultiHeadAttention(nn.Module):
             if attn_mask is not None:
                 pad = attn_mask[:, None, None, :].to(torch.bool)
                 out = F.scaled_dot_product_attention(Q, K, V, attn_mask=pad)
+            elif n_token > 1:
+                # Prompt prefill. This MUST be causal: without the mask every
+                # position attends to the future, which corrupts the hidden
+                # states of the whole prompt — including the last position,
+                # whose attention then reads those corrupted keys/values.
+                # (Previously this branch used the unmasked call intended for
+                # single-token decoding, so every generation ran on a context
+                # that had seen its own future: "What are you?" produced
+                # "You" instead of "I'm".)
+                out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
             else:
+                # Single-token incremental decode with a KV cache: there is no
+                # future to mask, and is_causal would misalign q_len=1 against
+                # k_len=N.
                 out = F.scaled_dot_product_attention(Q, K, V)
         else:
             if attn_mask is None:
@@ -209,18 +222,33 @@ class NanoGPT(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
-        # Positions per loss chunk. 1024 positions x 50261 vocab = ~0.4GB
-        # bf16 logits per chunk — small enough to keep several alive during
-        # autograd without threatening VRAM.
+        # Positions per loss chunk. Each chunk's logits + fp32 log-softmax
+        # internals are alive one at a time (see checkpointing note in
+        # forward()). IMPORTANT: 4096 (one chunk for the full sequence)
+        # OOMs the 96GB pool at batch 32 — the compiled backward keeps
+        # several full-size fp32 buffers of the chunk alive simultaneously
+        # (bf16 logits 12.3GB + fp32 temporaries ~25GB + their grads).
+        # Measured peak with chunk=1024 + ckpt_stride=2: ~45GB.
         self.loss_chunk_positions = 1024
+
+        # Gradient-checkpoint every Nth block (1 = all blocks, 2 = every
+        # other). MEASURED: stride 2 does NOT fit the 96GB pool at batch 32
+        # x 4096 — each non-checkpointed block retains ~5-7GB for backward
+        # (the 5120-wide FFN intermediates dominate), so 10 live blocks
+        # reach 91GB+ and OOM. Keep at 1 unless batch size is reduced.
+        self.ckpt_stride = 1
 
     def forward(self, token_ids, k_cache=None, v_cache=None, infer=False, pos_offset=0, attn_mask=None, targets=None):
         x = self.W_embed[token_ids]
         if not infer:
             # Training path: gradient checkpointing + skip building KV caches
             # to save activation memory.
-            for block in self.blocks:
-                x, _, _ = checkpoint(block, x, attn_mask=attn_mask, use_reentrant=False)
+            for i, block in enumerate(self.blocks):
+                if i % self.ckpt_stride == 0:
+                    x, _, _ = checkpoint(block, x, attn_mask=attn_mask,
+                                         use_reentrant=False)
+                else:
+                    x, _, _ = block(x, attn_mask=attn_mask)
             x = self.ln_f(x)
             if targets is not None:
                 # Chunked + checkpointed loss. The full logits tensor for a

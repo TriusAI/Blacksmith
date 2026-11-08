@@ -1,6 +1,14 @@
 import os
 import glob
 import pathlib
+import time
+
+# The ROCm runtime reads AMD_SERIALIZE_KERNEL when torch is imported, so
+# these must be set BEFORE `import torch` to take effect. (Previously they
+# were set after the import, so AMD_SERIALIZE_KERNEL never applied.)
+os.environ.setdefault('AMD_SERIALIZE_KERNEL', '3')
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -12,9 +20,6 @@ from dataset_mixed import MixedDatasetManager
 from hyperparameters import *
 
 # torchrun --nproc_per_node=N --master_addr=127.0.0.1 --master_port=29500 ./main.py
-
-os.environ['AMD_SERIALIZE_KERNEL']='3'
-os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 
 # ---------------------------------------------------------------------------
 # Distributed setup
@@ -42,7 +47,7 @@ if is_main:
 #   slimpajama 14.1B - general web/book/wiki text (core knowledge)
 #   cosmopedia 20.6B - synthetic educational text (reasoning-ish prose)
 #   ultrachat    1.9B - chat format (if the .bin is present on this machine)
-#   openthought  0.8B - reasoning traces w/ <think></think> tags (capability data)
+#   openthought  0.8B - reasoning traces w/ 皮肤病 tags (capability data)
 dataset = MixedDatasetManager(device, [
     ('slimpajama', sorted(glob.glob('slimpajama_subset_*.bin')), 0.40),
     ('cosmopedia', sorted(glob.glob('cosmopediav2_*.bin')),      0.35),
@@ -59,7 +64,10 @@ vocab_size = TokenizerVocabSize
 model = NanoGPT(vocab_size, d_model, n_heads, n_layers, max_seq_len).to(device)
 model = model.to(torch.bfloat16)
 
-optimizer = optim.AdamW(model.parameters(), lr=lr_peak, weight_decay=weight_decay)
+# fused=True keeps the AdamW update in a single multi-tensor kernel on the
+# device (many small per-parameter elementwise kernels otherwise).
+optimizer = optim.AdamW(model.parameters(), lr=lr_peak, weight_decay=weight_decay,
+                        fused=True)
 
 def lr_lambda(step):
     if step < warmup_steps:
@@ -94,8 +102,15 @@ scheduler = optim.lr_scheduler.LambdaLR(
 )
 
 # Wrap in DDP AFTER loading checkpoint (DDP adds "module." prefix to keys,
-# so we load the raw state dict first, then wrap).
-model = DDP(model, device_ids=[local_rank])
+# so we load the raw state dict first, then wrap). With a single process
+# there is no communication to do, and DDP would only add a gradient-bucket
+# copy, so skip it and keep a direct reference to the unwrapped model.
+if world_size > 1:
+    model = DDP(model, device_ids=[local_rank])
+raw_model = model.module if world_size > 1 else model
+print('compiling model...')
+model = torch.compile(model)
+print('model compiled.')
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -104,6 +119,7 @@ if is_main:
     print('training started')
 
 loss_counting = []
+step_t0 = time.perf_counter()
 for step in range(last_step, min(last_step + n_steps, total_steps)):
     inputs, targets = dataset.get_batch(batch_size, max_seq_len)
 
@@ -121,13 +137,16 @@ for step in range(last_step, min(last_step + n_steps, total_steps)):
     loss_counting.append(loss.item())
 
     if is_main:
+        t_now = time.perf_counter()
         print(f"Step {step}: loss={loss.item():.4f} "
-              f"avgloss={sum(loss_counting) / len(loss_counting):.4f}")
+              f"avgloss={sum(loss_counting) / len(loss_counting):.4f} "
+              f"step_time={t_now - step_t0:.1f}s")
+        step_t0 = t_now
     if step % 50 == 0 and is_main:
         print('saving checkpoint...')
         # Save the unwrapped module's state_dict (no "module." prefix).
         torch.save({
-            'model': model.module.state_dict(),
+            'model': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'step': step,
         }, 'blacksmith-1_model.pt')
@@ -136,7 +155,7 @@ for step in range(last_step, min(last_step + n_steps, total_steps)):
 
 if is_main:
     torch.save({
-        'model': model.module.state_dict(),
+        'model': raw_model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'step': step,
     }, 'blacksmith-1_model.pt')
